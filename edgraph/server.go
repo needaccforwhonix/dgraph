@@ -113,7 +113,11 @@ type existingGQLSchemaQryResp struct {
 // If multiple schema nodes were found, it returns an error.
 func GetGQLSchema(namespace uint64) (uid, graphQLSchema string, err error) {
 	ctx := context.WithValue(context.Background(), Authorize, false)
-	ctx = x.AttachNamespace(ctx, namespace)
+	// Trusted attribution: this runs on a hand-built background context with no
+	// request credential to present, and it crosses the tenant seam via
+	// QueryNoGrpc. Marking it keeps ResolveTenant from trying to derive a
+	// namespace that was never going to be there.
+	ctx = x.AttachTrustedTenant(ctx, namespace)
 	resp, err := (&Server{}).QueryNoGrpc(ctx,
 		&api.Request{
 			Query: `
@@ -218,6 +222,14 @@ func validateAlterOperation(ctx context.Context, op *api.Operation, doAuth AuthM
 		return nil
 	}
 
+	// Before hasAdminAuth, so an anonymous caller under a closed posture is told the
+	// actual reason -- no identity -- rather than whichever whitelist or token check
+	// happens to fail first. See RequireIdentifiedAdmin for why every Alter counts.
+	if err := RequireIdentifiedAdmin(ctx, "alter"); err != nil {
+		glog.Warningf("Alter denied with error: %v\n", err)
+		return err
+	}
+
 	if _, err := hasAdminAuth(ctx, "Alter"); err != nil {
 		glog.Warningf("Alter denied with error: %v\n", err)
 		return err
@@ -249,7 +261,7 @@ func parseSchemaFromAlterOperation(ctx context.Context, sch string) (
 	if x.IsRootNsOperation(ctx) {
 		// Only the guardian of the galaxy can do a galaxy wide query/mutation. This operation is
 		// needed by live loader.
-		if err := AuthSuperAdmin(ctx); err != nil {
+		if err := AuthorizeCapability(ctx, CapAssumeTenant); err != nil {
 			s := status.Convert(err)
 			return nil, status.Error(s.Code(),
 				"Non superadmin user cannot bypass namespaces. "+s.Message())
@@ -353,7 +365,18 @@ func InsertDropRecord(ctx context.Context, dropOp string) error {
 // Alter handles requests to change the schema or remove parts or all of the
 // data. It enforces the admin-IP-whitelist and ACL authorization checks.
 func (s *Server) Alter(ctx context.Context, op *api.Operation) (*api.Payload, error) {
-	return s.alter(ctx, op, NeedAuthorize)
+	// Entry point: drop the namespace the client sent before resolving.
+	//
+	// md["namespace"] is client-controlled on the server side, and the built-in
+	// resolver leaves whatever is there when it cannot derive one from the access
+	// JWT — so an unattributable request would otherwise proceed on the tenant the
+	// caller named. Authorization currently catches that, because it reads the signed
+	// claim, but that is an invariant held by call-site ordering, and relying on
+	// ordering is what produced the escalations this guards against.
+	//
+	// Deliberately here and not in the shared continuation below: alter also serves AlterNoAuth, which the
+	// in-process callers reach with a context they have already attributed.
+	return s.alter(x.ClearIncomingNamespace(ctx), op, NeedAuthorize)
 }
 
 // AlterNoAuth is Alter without the admin-IP-whitelist and ACL authorization
@@ -376,7 +399,10 @@ func (s *Server) alter(ctx context.Context, op *api.Operation, doAuth AuthMode) 
 	ctx, span := otel.Tracer("").Start(ctx, "Server.Alter")
 	defer span.End()
 
-	ctx = x.AttachJWTNamespace(ctx)
+	ctx, err := x.ResolveTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
 	span.AddEvent("Alter operation", trace.WithAttributes(attribute.String("op", op.String())))
 
 	// Always print out Alter operations because they are important and rare.
@@ -403,7 +429,7 @@ func (s *Server) alter(ctx context.Context, op *api.Operation, doAuth AuthMode) 
 			glog.V(2).Info("Blocked drop-all because it is not permitted.")
 			return empty, errors.New("Drop all operation is not permitted.")
 		}
-		if err := AuthSuperAdmin(ctx); err != nil {
+		if err := AuthorizeCapability(ctx, CapClusterAdmin); err != nil {
 			s := status.Convert(err)
 			return empty, status.Error(s.Code(),
 				"Drop all can only be called by the guardian of the galaxy. "+s.Message())
@@ -1230,7 +1256,7 @@ func (s *Server) Health(ctx context.Context, all bool) (*api.Response, error) {
 
 	var healthAll []pb.HealthInfo
 	if all {
-		if err := AuthorizeGuardians(ctx); err != nil {
+		if err := AuthorizeCapability(ctx, CapTenantAdmin); err != nil {
 			return nil, err
 		}
 		pool := conn.GetPools().GetAll()
@@ -1270,6 +1296,10 @@ func filterTablets(ctx context.Context, ms *pb.MembershipState) error {
 	if !x.WorkerConfig.AclEnabled {
 		return nil
 	}
+	// The signed claim, not the resolved namespace: this decides which tenant's
+	// tablets the CALLER may see, and State reaches here with no ResolveTenant
+	// ahead of it, so md["namespace"] would be whatever the caller sent. Reading it
+	// let a guardian of any tenant ask for namespace 0 and skip filtering entirely.
 	namespace, err := x.ExtractNamespaceFrom(ctx)
 	if err != nil {
 		return errors.Errorf("Namespace not found in JWT.")
@@ -1297,7 +1327,7 @@ func (s *Server) State(ctx context.Context) (*api.Response, error) {
 		return nil, ctx.Err()
 	}
 
-	if err := AuthorizeGuardians(ctx); err != nil {
+	if err := AuthorizeCapability(ctx, CapTenantAdmin); err != nil {
 		return nil, err
 	}
 
@@ -1344,7 +1374,18 @@ func (s *Server) QueryGraphQL(ctx context.Context, req *api.Request,
 }
 
 func (s *Server) Query(ctx context.Context, req *api.Request) (*api.Response, error) {
-	resp, err := s.QueryNoGrpc(ctx, req)
+	// Entry point: drop the namespace the client sent before resolving.
+	//
+	// md["namespace"] is client-controlled on the server side, and the built-in
+	// resolver leaves whatever is there when it cannot derive one from the access
+	// JWT — so an unattributable request would otherwise proceed on the tenant the
+	// caller named. Authorization currently catches that, because it reads the signed
+	// claim, but that is an invariant held by call-site ordering, and relying on
+	// ordering is what produced the escalations this guards against.
+	//
+	// Deliberately here and not in the shared continuation below: QueryNoGrpc also serves the two HTTP
+	// handlers and GetGQLSchema, which attaches its own trusted tenancy.
+	resp, err := s.QueryNoGrpc(x.ClearIncomingNamespace(ctx), req)
 	if err != nil {
 		return resp, err
 	}
@@ -1357,7 +1398,10 @@ func (s *Server) Query(ctx context.Context, req *api.Request) (*api.Response, er
 
 // Query handles queries or mutations
 func (s *Server) QueryNoGrpc(ctx context.Context, req *api.Request) (*api.Response, error) {
-	ctx = x.AttachJWTNamespace(ctx)
+	ctx, err := x.ResolveTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if x.WorkerConfig.AclEnabled && req.GetStartTs() != 0 {
 		// A fresh StartTs is assigned if it is 0.
 		ns, err := x.ExtractNamespace(ctx)
@@ -1478,10 +1522,24 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (resp *api.Response,
 		ostats.Record(ctx, x.NumMutations.M(1))
 	}
 
+	if req.doAuth == NeedAuthorize {
+		// Gated on NeedAuthorize, which is what distinguishes a network-originated
+		// request from an in-process one: QueryNoAuth and the internal DQL callers
+		// run with NoAuthorize and a context.Background() that could never carry a
+		// Principal.
+		op := "query"
+		if isMutation {
+			op = "mutation"
+		}
+		if err := RequireIdentifiedCaller(ctx, op); err != nil {
+			return nil, err
+		}
+	}
+
 	if req.doAuth == NeedAuthorize && x.IsRootNsOperation(ctx) {
 		// Only the guardian of the galaxy can do a galaxy wide query/mutation. This operation is
 		// needed by live loader.
-		if err := AuthSuperAdmin(ctx); err != nil {
+		if err := AuthorizeCapability(ctx, CapAssumeTenant); err != nil {
 			s := status.Convert(err)
 			return nil, status.Error(s.Code(),
 				"Non superadmin user cannot bypass namespaces. "+s.Message())
@@ -2071,7 +2129,7 @@ func (s *Server) UpdateExtSnapshotStreamingState(ctx context.Context,
 	// it is protected under ACL and under an --security auth-token. Each gate fails open when
 	// its feature is unconfigured, so the arming requirement on the stream path backstops the
 	// bare-OSS case.
-	if err := AuthorizeGuardians(ctx); err != nil {
+	if err := AuthorizeCapability(ctx, CapTenantAdmin); err != nil {
 		return nil, err
 	}
 	if err := hasPoormansAuth(ctx); err != nil {
@@ -2098,7 +2156,7 @@ func (s *Server) StreamExtSnapshot(stream api.Dgraph_StreamExtSnapshotServer) er
 
 	// Authorize at stream start, before any data is consumed. Stream auth metadata rides on the
 	// stream's context, so the same gates used for the unary entry point apply here.
-	if err := AuthorizeGuardians(stream.Context()); err != nil {
+	if err := AuthorizeCapability(stream.Context(), CapTenantAdmin); err != nil {
 		return err
 	}
 	if err := hasPoormansAuth(stream.Context()); err != nil {
@@ -2121,12 +2179,16 @@ func (s *Server) CommitOrAbort(ctx context.Context, tc *api.TxnContext) (*api.Tx
 		return &api.TxnContext{}, err
 	}
 
+	if err := RequireIdentifiedCaller(ctx, "commit"); err != nil {
+		return &api.TxnContext{}, err
+	}
+
 	tctx := &api.TxnContext{}
 	if tc.StartTs == 0 {
 		return &api.TxnContext{}, errors.Errorf(
 			"StartTs cannot be zero while committing a transaction")
 	}
-	if ns, err := x.ExtractNamespaceFrom(ctx); err == nil {
+	if ns, err := x.ExtractNamespace(ctx); err == nil {
 		annotateNamespace(span, ns)
 	}
 	annotateStartTs(span, tc.StartTs)
@@ -2448,42 +2510,82 @@ func isDropOperation(op *api.Operation) bool {
 	return op.DropAll || op.DropOp != api.Operation_NONE || len(op.DropAttr) > 0
 }
 
+// uniqueValueKey identifies a value for the in-request duplicate check: two edges
+// collide iff they write the same value to the same predicate under the same language
+// tag (language is part of value identity since #9820). For comparable values the value
+// field holds the interface{} produced by dql.TypeValFrom, so Go's dynamic-type
+// identity gives exactly the semantics the previous ==-based check had: int64(1) and
+// "1" stay distinct, while an untyped RDF literal (DefaultVal) and a JSON string
+// (StrVal) — both a Go string — stay EQUAL. Keying on types.TypeID for every value
+// split those two apart and let duplicates through when RDF and JSON mutations were
+// mixed in one request (caught in review).
+type uniqueValueKey struct {
+	predicate string
+	lang      string
+	value     interface{}
+}
+
+// byteContent keys slice-typed values by exact byte content. Its own Go type keeps it
+// from colliding with a plain string value of the same bytes, and tid separates the
+// four []byte-backed types (binary/geo/datetime/bigfloat) and vfloat from one another.
+type byteContent struct {
+	tid   types.TypeID
+	bytes string
+}
+
+// uniqueValueKeyFrom builds a hashable key for tv. dql.TypeValFrom returns slice-typed
+// values for five branches — []byte for bytes/geo/datetime/bigfloat and []float32 for
+// vfloat — which must not be used as map keys (hash of unhashable type panics, and
+// there is no recover on the mutation path). These reach this function from a plain
+// JSON mutation: the chunker parses any "[...]"-shaped string into a Vfloat32Val before
+// the schema is consulted. Slice values are wrapped in byteContent; everything else
+// passes through unchanged so that map-key equality is the old == equality.
+// The previous == comparison panicked outright on two same-predicate slice values, so
+// content equality for those replaces a crash rather than changing working behavior.
+func uniqueValueKeyFrom(predicate, lang string, tv types.Val) uniqueValueKey {
+	value := tv.Value
+	switch v := tv.Value.(type) {
+	case []byte:
+		value = byteContent{tid: tv.Tid, bytes: string(v)}
+	case []float32:
+		value = byteContent{tid: tv.Tid, bytes: string(types.FloatArrayAsBytes(v))}
+	}
+	return uniqueValueKey{predicate: predicate, lang: lang, value: value}
+}
+
+// verifyUniqueWithinMutation rejects a request in which two edges set the same value on
+// the same @unique predicate, under the same language tag, for different subjects. A
+// single linear pass over a seen-map replaces the earlier every-pair scan, which was
+// O(N^2) in the number of unique-predicate edges and dominated large batched mutations
+// (issue #9814).
 func verifyUniqueWithinMutation(qc *queryContext) error {
 	if len(qc.uniqueVars) == 0 {
 		return nil
 	}
 
+	// Maps each (predicate, lang, value) to the subject of the first edge that set it.
+	// Duplicate values from the same subject are permitted, as before.
+	seen := make(map[uniqueValueKey]string, len(qc.uniqueVars))
 	for i := range qc.uniqueVars {
 		gmuIndex, rdfIndex := decodeIndex(i)
 		// handles cases where the mutation was pruned in updateMutations
 		if gmuIndex >= uint32(len(qc.gmuList)) || qc.gmuList[gmuIndex] == nil || rdfIndex >= uint32(len(qc.gmuList[gmuIndex].Set)) {
 			continue
 		}
-		pred1 := qc.gmuList[gmuIndex].Set[rdfIndex]
-		if pred1.ObjectValue == nil {
+		pred := qc.gmuList[gmuIndex].Set[rdfIndex]
+		if pred.ObjectValue == nil {
 			continue
 		}
-		pred1Value := dql.TypeValFrom(pred1.ObjectValue).Value
-		for j := range qc.uniqueVars {
-			if i == j {
-				continue
-			}
-			gmuIndex2, rdfIndex2 := decodeIndex(j)
-			// check for the second predicate, which could also have been pruned
-			if gmuIndex2 >= uint32(len(qc.gmuList)) || qc.gmuList[gmuIndex2] == nil || rdfIndex2 >= uint32(len(qc.gmuList[gmuIndex2].Set)) {
-				continue
-			}
-			pred2 := qc.gmuList[gmuIndex2].Set[rdfIndex2]
-			if pred2.ObjectValue == nil {
-				continue
-			}
-			if pred2.Predicate == pred1.Predicate && pred2.Lang == pred1.Lang &&
-				dql.TypeValFrom(pred2.ObjectValue).Value == pred1Value &&
-				pred2.Subject != pred1.Subject {
+		tv := dql.TypeValFrom(pred.ObjectValue)
+		key := uniqueValueKeyFrom(pred.Predicate, pred.Lang, tv)
+		if subject, ok := seen[key]; ok {
+			if subject != pred.Subject {
 				return errors.Errorf("could not insert duplicate value [%v] for predicate [%v]",
-					pred1Value, predicateNameWithLang(pred1))
+					tv.Value, predicateNameWithLang(pred))
 			}
+			continue
 		}
+		seen[key] = pred.Subject
 	}
 	return nil
 }
